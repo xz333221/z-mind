@@ -306,5 +306,12 @@ defineProps<{
       <polyline points="8 14 6 16 8 18" />
       <polyline points="14 14 16 16 14 18" />
     </template>
+    <!-- relation: two nodes joined by a dashed curve — reads as
+         "联系 / relationship line" (XMind). -->
+    <template v-else-if="name === 'relation'">
+      <circle cx="5" cy="19" r="2.5" />
+      <circle cx="19" cy="5" r="2.5" />
+      <path d="M7 17 C 10 12, 14 12, 17 7" stroke-dasharray="3 2.2" />
+    </template>
   </svg>
 </template>

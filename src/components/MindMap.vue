@@ -22,11 +22,17 @@ import {
   cloneSubtree,
   reassignIds,
   countDescendants,
+  addRelation,
+  removeRelation,
+  updateRelation,
+  reattachRelation,
+  removeRelationsForNode,
+  findRelation,
   DEFAULT_NEW_NODE_TEXT,
   markdownToMindMap,
   mindMapToMarkdown,
 } from '../tree'
-import type { MindMapNode, MindMapTheme, MindMapExpose, MindMapSettings, NodeStyle, MindMapImage, LineOrigin, LineStyle } from '../types'
+import type { MindMapNode, MindMapTheme, MindMapExpose, MindMapSettings, NodeStyle, MindMapImage, MindMapRelation, LineOrigin, LineStyle } from '../types'
 import { usePanZoom } from '../composables/usePanZoom'
 import { useKeyboard } from '../composables/useKeyboard'
 import { useHistory } from '../composables/useHistory'
@@ -848,6 +854,14 @@ function menuRemoveTable() {
   if (!id) return
   applyNodeRichContent(id, null)
 }
+/** 右键菜单「添加联系」— enter relation-creation mode with the
+ *  right-clicked node as the first endpoint.  The menu closes
+ *  itself via its `close` emit (fired by `run()`). */
+function menuAddRelation() {
+  const id = contextMenu.value?.nodeId
+  if (!id) return
+  startRelationMode(id)
+}
 
 // ---------------------------------------------------------------------------
 // Note editing — the actual textarea lives in App.vue's right-side
@@ -976,6 +990,20 @@ function onGlobalKeydown(e: KeyboardEvent) {
     }
     e.preventDefault()
     emit('canvas-outline')
+    return
+  }
+  // Delete/Backspace with a relationship line selected removes the
+  // line.  Handled here (not via useKeyboard) because line
+  // selection clears the NODE selection, and useKeyboard's Delete
+  // branch requires a selected node id.
+  if ((e.key === 'Delete' || e.key === 'Backspace') && selectedRelationId.value) {
+    const tgt = e.target as HTMLElement | null
+    if (tgt && (tgt.tagName === 'INPUT' || tgt.tagName === 'TEXTAREA' || tgt.isContentEditable)) {
+      return
+    }
+    if (props.previewMode) return
+    e.preventDefault()
+    doRemoveRelation(selectedRelationId.value)
   }
 }
 
@@ -1886,6 +1914,16 @@ useKeyboard({
   onRemove: doRemove,
   onStartEdit: startEdit,
   onClearSelection: () => {
+    // Escape unwinds in layers: creation mode → selected relation
+    // line → node selection.
+    if (relationMode.value) {
+      relationMode.value = null
+      return
+    }
+    if (selectedRelationId.value) {
+      selectedRelationId.value = null
+      return
+    }
     selectedIds.value = new Set()
     emitSelection()
   },
@@ -2202,9 +2240,17 @@ function doCut(ids: string[]) {
   }
   if (subs.length === 0) return
   record()
+  // Capture subtree ids before removal so relationship lines that
+  // reference any removed node (including descendants) are dropped.
+  const removedIds: string[] = []
+  for (const id of clean) {
+    const sub = findNode(dataRef.value, id)
+    if (sub) removedIds.push(...subtreeIds(sub))
+  }
   // Immediate-delete semantics: remove originals now, drop the
   // selection.  Undo restores both via the history snapshot.
   for (const id of clean) removeNode(dataRef.value, id)
+  for (const id of removedIds) removeRelationsForNode(dataRef.value, id)
   selectedIds.value = new Set()
   emitSelection()
   clipboard.value = { nodes: subs, originalIds: new Set(clean) }
@@ -2351,7 +2397,17 @@ function paragraphText(raw: string): string {
 
 function doRemove(nodeId: string) {
   if (nodeId === dataRef.value.id) return
+  // Capture the whole subtree's ids BEFORE removal so we can drop
+  // any relationship lines that reference them.
+  const subtree = findNode(dataRef.value, nodeId)
+  const removedIds = subtree ? subtreeIds(subtree) : [nodeId]
   if (removeNode(dataRef.value, nodeId)) {
+    for (const id of removedIds) removeRelationsForNode(dataRef.value, id)
+    // A pending relation-creation mode pointing at a removed node
+    // can never complete — cancel it.
+    if (relationMode.value?.fromId && removedIds.includes(relationMode.value.fromId)) {
+      relationMode.value = null
+    }
     record()
     // If the removed node was in the selection set, drop it.
     if (selectedIds.value.has(nodeId)) {
@@ -2481,6 +2537,26 @@ function doMoveSibling(dy: number) {
 
 function onNodeClick(e: MouseEvent, n: LayoutNode) {
   e.stopPropagation()
+  // Relation-creation mode: clicks pick endpoints instead of
+  // changing the selection.  First click fills `fromId` (when the
+  // mode was entered without a pre-filled node), the second click
+  // on a DIFFERENT node completes the line.  Clicking the source
+  // again is a no-op — Esc / canvas click cancels the mode.
+  if (relationMode.value) {
+    const mode = relationMode.value
+    if (!mode.fromId) {
+      mode.fromId = n.id
+      selectedIds.value = new Set([n.id])
+      emitSelection()
+    } else if (mode.fromId !== n.id) {
+      doAddRelation(mode.fromId, n.id)
+      relationMode.value = null
+    }
+    return
+  }
+  // A plain node click drops any selected relation line (node
+  // selection and line selection are mutually exclusive).
+  selectedRelationId.value = null
   // Shift+click toggles membership in the multi-select set; plain
   // click replaces the set with just this node.  Note: the
   // pointerdown handler does NOT touch selection anymore (see
@@ -2725,6 +2801,382 @@ function onDragPointerUp(_e: PointerEvent) {
   document.body.classList.remove('is-dragging')
 }
 
+// ---------------------------------------------------------------------------
+// Relationship lines ("联系") — XMind-style dashed connections between
+// any two nodes.  Data lives on the root as `root.relations` (CRUD in
+// tree.ts); undo/redo and JSON export/import pick it up for free.
+// ---------------------------------------------------------------------------
+
+/** Currently selected relation — its four handles (2 endpoints +
+ *  2 bezier control points) render while this is set.  Mutually
+ *  exclusive with node selection: picking a line clears the node
+ *  selection and vice versa. */
+const selectedRelationId = ref<string | null>(null)
+
+/** Creation mode, entered via the toolbar 联系 button or the node
+ *  context menu.  `fromId` is null until the user clicks the first
+ *  node; the next node click completes the line.  Esc or a canvas
+ *  click cancels. */
+const relationMode = ref<{ fromId: string | null } | null>(null)
+
+/** In-flight handle drag.  `end` picks which of the 4 handles is
+ *  moving; wx/wy is the live pointer position in WORLD coords.  The
+ *  geometry computed reads these so the line tracks the pointer
+ *  without touching dataRef — the final position is committed once
+ *  on pointerup, firing a single history record (same pattern as
+ *  the image-resize drag). */
+const relationDrag = ref<{
+  id: string
+  end: 'from' | 'to' | 'c1' | 'c2'
+  wx: number
+  wy: number
+  /** Node under the pointer during an endpoint drag — re-attach
+   *  target on drop. */
+  hoverNodeId: string | null
+} | null>(null)
+
+// Label editing — which relation's label is being edited inline,
+// plus the live draft text.
+const relationEditingId = ref<string | null>(null)
+const relationEditText = ref('')
+
+/** Convert a perimeter parameter s ∈ [0,4) to a point on the node
+ *  rect.  0→1 walks the top edge L→R, 1→2 the right edge T→B,
+ *  2→3 the bottom edge R→L, 3→4 the left edge B→T.  Perimeter
+ *  params survive layout changes because they only depend on the
+ *  node's own width/height. */
+function perimeterPoint(n: LayoutNode, s: number): { x: number; y: number } {
+  const w = n.width / 2
+  const h = n.height / 2
+  const t = ((s % 4) + 4) % 4
+  if (t < 1) return { x: n.x - w + 2 * w * t, y: n.y - h }
+  if (t < 2) return { x: n.x + w, y: n.y - h + 2 * h * (t - 1) }
+  if (t < 3) return { x: n.x + w - 2 * w * (t - 2), y: n.y + h }
+  return { x: n.x - w, y: n.y + h - 2 * h * (t - 3) }
+}
+
+/** Ray-cast from the node center toward `target`; return the point
+ *  where the ray exits the node rect. */
+function rectRayPoint(n: LayoutNode, target: { x: number; y: number }): { x: number; y: number } {
+  const dx = target.x - n.x
+  const dy = target.y - n.y
+  const w = n.width / 2
+  const h = n.height / 2
+  if (Math.abs(dx) < 1e-6 && Math.abs(dy) < 1e-6) return { x: n.x + w, y: n.y }
+  const tx = Math.abs(dx) > 1e-6 ? w / Math.abs(dx) : Infinity
+  const ty = Math.abs(dy) > 1e-6 ? h / Math.abs(dy) : Infinity
+  const t = Math.min(tx, ty)
+  return { x: n.x + dx * t, y: n.y + dy * t }
+}
+
+/** Inverse of perimeterPoint: given a point on the rect border,
+ *  return its perimeter parameter. */
+function perimeterParam(n: LayoutNode, p: { x: number; y: number }): number {
+  const w = n.width / 2 || 1
+  const h = n.height / 2 || 1
+  const rx = p.x - n.x
+  const ry = p.y - n.y
+  const onVertical = Math.abs(rx) / w > Math.abs(ry) / h
+  if (onVertical) {
+    if (rx > 0) return 1 + clamp((ry + h) / (2 * h), 0, 1) // right edge
+    return 3 + clamp((h - ry) / (2 * h), 0, 1) // left edge
+  }
+  if (ry < 0) return clamp((rx + w) / (2 * w), 0, 1) // top edge
+  return 2 + clamp((w - rx) / (2 * w), 0, 1) // bottom edge
+}
+
+/** Resolve one endpoint of a relation to world coordinates.
+ *  Priority: live drag position → stored perimeter offset →
+ *  auto ray-cast toward the other node's center. */
+function relationEndpoint(
+  rel: MindMapRelation,
+  end: 'from' | 'to',
+  fromNode: LayoutNode,
+  toNode: LayoutNode
+): { x: number; y: number } {
+  const node = end === 'from' ? fromNode : toNode
+  const other = end === 'from' ? toNode : fromNode
+  const drag = relationDrag.value
+  if (drag && drag.id === rel.id && drag.end === end) {
+    return rectRayPoint(node, { x: drag.wx, y: drag.wy })
+  }
+  const t = end === 'from' ? rel.fromT : rel.toT
+  if (t !== undefined) return perimeterPoint(node, t)
+  return rectRayPoint(node, { x: other.x, y: other.y })
+}
+
+interface RelationGeom {
+  rel: MindMapRelation
+  from: { x: number; y: number }
+  to: { x: number; y: number }
+  c1: { x: number; y: number }
+  c2: { x: number; y: number }
+  /** SVG path data for the cubic bezier. */
+  d: string
+  /** Curve midpoint — where the label sits. */
+  labelPos: { x: number; y: number }
+  /** Arrowhead triangle paths (null = that end has no arrow). */
+  arrowEnd: string | null
+  arrowStart: string | null
+}
+
+/** Triangle path for an arrowhead whose TIP sits at `p`, pointing
+ *  along tangent `t` (not necessarily normalized).  Returns null
+ *  for a degenerate tangent (zero-length control offset) — the
+ *  line just ends bare in that case. */
+function arrowHeadPath(p: { x: number; y: number }, t: { x: number; y: number }): string | null {
+  const len = Math.hypot(t.x, t.y)
+  if (len < 1e-6) return null
+  const dx = t.x / len
+  const dy = t.y / len
+  const L = 9 // tip-to-base length
+  const W = 7 // base width
+  const bx = p.x - dx * L
+  const by = p.y - dy * L
+  const nx = -dy * (W / 2)
+  const ny = dx * (W / 2)
+  return (
+    `M ${p.x.toFixed(2)} ${p.y.toFixed(2)}` +
+    ` L ${(bx + nx).toFixed(2)} ${(by + ny).toFixed(2)}` +
+    ` L ${(bx - nx).toFixed(2)} ${(by - ny).toFixed(2)} Z`
+  )
+}
+
+const relationGeoms = computed<RelationGeom[]>(() => {
+  const list = dataRef.value.relations
+  if (!list || list.length === 0) return []
+  const out: RelationGeom[] = []
+  for (const rel of list) {
+    const fromNode = allNodes.value.find((n) => n.id === rel.fromId)
+    const toNode = allNodes.value.find((n) => n.id === rel.toId)
+    // An endpoint is hidden (collapsed ancestor) or was just
+    // deleted — skip rendering rather than drawing a broken line.
+    if (!fromNode || !toNode) continue
+    const from = relationEndpoint(rel, 'from', fromNode, toNode)
+    const to = relationEndpoint(rel, 'to', fromNode, toNode)
+    const drag = relationDrag.value
+    let c1 = rel.c1
+    let c2 = rel.c2
+    if (drag && drag.id === rel.id && drag.end === 'c1') c1 = { x: drag.wx, y: drag.wy }
+    if (drag && drag.id === rel.id && drag.end === 'c2') c2 = { x: drag.wx, y: drag.wy }
+    if (!c1 || !c2) {
+      // Auto bow: a single control point on the perpendicular
+      // through the midpoint, biased upward, sized by the endpoint
+      // gap — gives fresh relations the gentle XMind-style arc.
+      const dx = to.x - from.x
+      const dy = to.y - from.y
+      const dist = Math.hypot(dx, dy) || 1
+      let nx = -dy / dist
+      let ny = dx / dist
+      if (ny > 0) {
+        nx = -nx
+        ny = -ny
+      }
+      const bow = clamp(dist * 0.18, 24, 160)
+      const mid = { x: (from.x + to.x) / 2 + nx * bow, y: (from.y + to.y) / 2 + ny * bow }
+      if (!c1) c1 = mid
+      if (!c2) c2 = mid
+    }
+    const d =
+      `M ${from.x.toFixed(2)} ${from.y.toFixed(2)} ` +
+      `C ${c1.x.toFixed(2)} ${c1.y.toFixed(2)} ${c2.x.toFixed(2)} ${c2.y.toFixed(2)} ${to.x.toFixed(2)} ${to.y.toFixed(2)}`
+    const labelPos = cubicAt(0.5, from, { x1: c1.x, y1: c1.y, x2: c2.x, y2: c2.y }, to)
+    // Arrowheads: default 'end' (XMind 联系 style — the arrow points
+    // at the second-picked node).  The end tangent is `to - c2`; the
+    // start arrow points outward, i.e. along `from - c1`.
+    const arrowDir = rel.arrow ?? 'end'
+    const arrowEnd =
+      arrowDir === 'none' ? null : arrowHeadPath(to, { x: to.x - c2.x, y: to.y - c2.y })
+    const arrowStart =
+      arrowDir === 'both' ? arrowHeadPath(from, { x: from.x - c1.x, y: from.y - c1.y }) : null
+    out.push({ rel, from, to, c1, c2, d, labelPos, arrowEnd, arrowStart })
+  }
+  return out
+})
+
+/** Geometry of the relation currently being label-edited (drives
+ *  the floating input's position). */
+const editingRelationGeom = computed<RelationGeom | null>(
+  () => relationGeoms.value.find((g) => g.rel.id === relationEditingId.value) ?? null
+)
+
+function doAddRelation(fromId: string, toId: string): string | null {
+  const rel = addRelation(dataRef.value, fromId, toId)
+  if (!rel) return null
+  record()
+  triggerRef()
+  emit('change', dataRef.value)
+  // Select the fresh line so its handles show immediately.  Line
+  // selection replaces node selection (they're mutually exclusive).
+  selectedRelationId.value = rel.id
+  selectedIds.value = new Set()
+  emitSelection()
+  return rel.id
+}
+
+function doRemoveRelation(id: string) {
+  if (removeRelation(dataRef.value, id)) {
+    record()
+    if (selectedRelationId.value === id) selectedRelationId.value = null
+    if (relationEditingId.value === id) relationEditingId.value = null
+    triggerRef()
+    emit('change', dataRef.value)
+  }
+}
+
+function doUpdateRelation(
+  id: string,
+  patch: Partial<Omit<MindMapRelation, 'id' | 'fromId' | 'toId'>>
+) {
+  if (updateRelation(dataRef.value, id, patch)) {
+    record()
+    triggerRef()
+    emit('change', dataRef.value)
+  }
+}
+
+/** Enter relation-creation mode.  `fromId` pre-fills the first
+ *  endpoint (toolbar button uses the current selection; the node
+ *  context menu uses the right-clicked node). */
+function startRelationMode(fromId: string | null) {
+  if (props.previewMode) return
+  relationMode.value = { fromId }
+  if (fromId) {
+    selectedIds.value = new Set([fromId])
+    emitSelection()
+  }
+}
+
+/** Toolbar 联系 button — toggles creation mode. */
+function onRelationToolbarClick() {
+  if (relationMode.value) {
+    relationMode.value = null
+    return
+  }
+  startRelationMode(selectedId.value)
+}
+
+function onRelationClick(e: MouseEvent, id: string) {
+  e.stopPropagation()
+  selectedRelationId.value = id
+  selectedIds.value = new Set()
+  emitSelection()
+}
+
+// --- handle dragging -------------------------------------------------------
+
+function onRelationHandlePointerDown(
+  e: PointerEvent,
+  id: string,
+  end: 'from' | 'to' | 'c1' | 'c2'
+) {
+  if (props.previewMode) return
+  e.stopPropagation()
+  e.preventDefault()
+  const wrapperRect = wrapperRef.value!.getBoundingClientRect()
+  relationDrag.value = {
+    id,
+    end,
+    wx: (e.clientX - wrapperRect.left - panZoom.offsetX.value) / panZoom.scale.value,
+    wy: (e.clientY - wrapperRect.top - panZoom.offsetY.value) / panZoom.scale.value,
+    hoverNodeId: null,
+  }
+  window.addEventListener('pointermove', onRelationHandleMove)
+  window.addEventListener('pointerup', onRelationHandleUp)
+  window.addEventListener('pointercancel', onRelationHandleUp)
+}
+
+function onRelationHandleMove(e: PointerEvent) {
+  const s = relationDrag.value
+  if (!s) return
+  const wrapperRect = wrapperRef.value!.getBoundingClientRect()
+  s.wx = (e.clientX - wrapperRect.left - panZoom.offsetX.value) / panZoom.scale.value
+  s.wy = (e.clientY - wrapperRect.top - panZoom.offsetY.value) / panZoom.scale.value
+  if (s.end === 'from' || s.end === 'to') {
+    // Endpoint drag: track the node under the pointer as a possible
+    // re-attach target (excluding the end's own current node, which
+    // means "slide along my edge" instead).
+    const rel = findRelation(dataRef.value, s.id)
+    const selfId = rel ? (s.end === 'from' ? rel.fromId : rel.toId) : null
+    const hit = getNodeAtPointer(s.wx, s.wy, selfId)
+    s.hoverNodeId = hit?.id ?? null
+  }
+}
+
+function onRelationHandleUp() {
+  window.removeEventListener('pointermove', onRelationHandleMove)
+  window.removeEventListener('pointerup', onRelationHandleUp)
+  window.removeEventListener('pointercancel', onRelationHandleUp)
+  const s = relationDrag.value
+  relationDrag.value = null
+  if (!s) return
+  const rel = findRelation(dataRef.value, s.id)
+  if (!rel) return
+  if (s.end === 'c1' || s.end === 'c2') {
+    rel[s.end] = { x: Math.round(s.wx * 2) / 2, y: Math.round(s.wy * 2) / 2 }
+  } else {
+    const selfId = s.end === 'from' ? rel.fromId : rel.toId
+    const reattached =
+      s.hoverNodeId && s.hoverNodeId !== selfId
+        ? reattachRelation(dataRef.value, s.id, s.end, s.hoverNodeId)
+        : false
+    if (!reattached) {
+      // Slide along the current node's perimeter: convert the
+      // pointer ray to a perimeter parameter.
+      const node = allNodes.value.find((n) => n.id === selfId)
+      if (node) {
+        const p = rectRayPoint(node, { x: s.wx, y: s.wy })
+        const t = perimeterParam(node, p)
+        if (s.end === 'from') rel.fromT = t
+        else rel.toT = t
+      }
+    }
+  }
+  record()
+  triggerRef()
+  emit('change', dataRef.value)
+}
+
+// --- label editing ---------------------------------------------------------
+
+function startRelationLabelEdit(id: string) {
+  if (props.previewMode) return
+  const rel = findRelation(dataRef.value, id)
+  if (!rel) return
+  relationEditingId.value = id
+  relationEditText.value = rel.label ?? ''
+  selectedRelationId.value = id
+  nextTick(() => {
+    const el = document.querySelector('.zm-relation-label-input') as HTMLInputElement | null
+    el?.focus()
+    el?.select()
+  })
+}
+
+function commitRelationLabel() {
+  const id = relationEditingId.value
+  if (!id) return
+  relationEditingId.value = null
+  const rel = findRelation(dataRef.value, id)
+  if (!rel) return
+  const text = relationEditText.value.trim()
+  if ((rel.label ?? '') !== text) {
+    doUpdateRelation(id, { label: text || undefined })
+  }
+}
+
+/** Collect the ids of a node and its whole subtree — used to drop
+ *  relationship lines when any of those nodes disappears. */
+function subtreeIds(root: MindMapNode): string[] {
+  const out: string[] = []
+  const walk = (n: MindMapNode) => {
+    out.push(n.id)
+    for (const c of n.children) walk(c)
+  }
+  walk(root)
+  return out
+}
+
 /** Click on the canvas background (not on a node) — clear the
  *  current selection and tell the parent. */
 // Tracks whether the most recent canvas pan was started with the
@@ -2737,9 +3189,10 @@ function onCanvasMouseDown(e: MouseEvent) {
   const target = e.target as HTMLElement | null
   if (!target) return
   // Don't start a canvas-level gesture when the press lands on a
-  // node, the toolbar, or any control button — those have their
-  // own handlers (drag-node, button click, etc).
-  if (target.closest('.zm-node, .zm-toolbar, button, input, textarea')) return
+  // node, the toolbar, any control button, or a relationship line
+  // — those have their own handlers (drag-node, button click,
+  // relation select / handle drag, etc).
+  if (target.closest('.zm-node, .zm-toolbar, button, input, textarea, .zm-relations')) return
   if (e.button === 2) {
     // Right button: pan the canvas.
     lastPanWasRightButton = true
@@ -2771,12 +3224,28 @@ function onCanvasClick(e: MouseEvent) {
   if (!target) return
   // Ignore clicks that land on a node or its control buttons.
   if (target.closest('.zm-node')) return
+  // Ignore clicks that originate from the floating toolbar — it
+  // sits inside .zm-canvas, so button clicks bubble here.  For
+  // immediate-action buttons (zoom, add node…) the trailing
+  // deselect is harmless, but toggle buttons like 联系 would have
+  // the mode they just switched ON immediately cancelled below.
+  if (target.closest('.zm-toolbar')) return
   // If a marquee just finished (drag was wide enough to count as
   // a real selection gesture), keep whatever the marquee picked.
   // Only treat a *tiny* marquee — i.e. a click with no real drag —
   // as a deselect.
   const m = panZoom.marquee
   if (m.width >= 4 || m.height >= 4) return
+  // A canvas click cancels relation-creation mode first — the user
+  // changed their mind about picking a second endpoint.
+  if (relationMode.value) {
+    relationMode.value = null
+    return
+  }
+  if (selectedRelationId.value) {
+    selectedRelationId.value = null
+    return
+  }
   if (selectedIds.value.size > 0) {
     selectedIds.value = new Set()
     emitSelection()
@@ -3348,6 +3817,46 @@ function buildExportSVG(): SVGSVGElement {
       }
     }
     return w
+  }
+
+  // Relationship lines ("联系"): dashed curves + labels, drawn
+  // above the tree edges but UNDER the node rects (DOM order:
+  // edges, then relations, then nodes), mirroring the on-canvas
+  // layering.
+  for (const g of relationGeoms.value) {
+    const path = document.createElementNS(svgNS, 'path')
+    path.setAttribute('d', g.d)
+    path.setAttribute('fill', 'none')
+    path.setAttribute('stroke', g.rel.color ?? '#94a3b8')
+    path.setAttribute('stroke-width', '1.5')
+    path.setAttribute('stroke-dasharray', '6 4')
+    path.setAttribute('stroke-linecap', 'round')
+    svgEl.appendChild(path)
+    // Arrowheads — same geometry as the on-canvas renderer.
+    const arrowFill = g.rel.color ?? '#94a3b8'
+    for (const ad of [g.arrowEnd, g.arrowStart]) {
+      if (!ad) continue
+      const ap = document.createElementNS(svgNS, 'path')
+      ap.setAttribute('d', ad)
+      ap.setAttribute('fill', arrowFill)
+      ap.setAttribute('stroke', 'none')
+      svgEl.appendChild(ap)
+    }
+    if (g.rel.label) {
+      const t = document.createElementNS(svgNS, 'text')
+      t.setAttribute('x', String(g.labelPos.x))
+      t.setAttribute('y', String(g.labelPos.y - 6))
+      t.setAttribute('text-anchor', 'middle')
+      t.setAttribute('font-size', '12')
+      t.setAttribute('font-family', FONT_FAMILY)
+      t.setAttribute('fill', '#64748b')
+      // White halo so the label stays readable over edges.
+      t.setAttribute('stroke', effectiveBg.value)
+      t.setAttribute('stroke-width', '3')
+      t.setAttribute('paint-order', 'stroke')
+      t.textContent = g.rel.label
+      svgEl.appendChild(t)
+    }
   }
 
   for (const n of allNodes.value) {
@@ -3942,6 +4451,12 @@ if (s.branchGap !== undefined) settings.branchGap = Math.max(0, Math.min(80, s.b
   // outline panel highlighting matches).  These are read-only.
   getSearchResults: () => [...searchResults.value],
   getSearchIndex: () => searchIndex.value,
+  // Relationship lines ("联系") — free-form dashed connections
+  // between any two nodes.
+  addRelation: (fromId: string, toId: string) => doAddRelation(fromId, toId),
+  removeRelation: (relationId: string) => doRemoveRelation(relationId),
+  updateRelation: (relationId: string, patch) => doUpdateRelation(relationId, patch),
+  getRelations: () => clone(dataRef.value.relations ?? []),
 })
 
 watch(
@@ -3981,6 +4496,7 @@ onMounted(() => {
     <div
       ref="wrapperRef"
       class="zm-canvas"
+      :class="{ 'is-relation-mode': !!relationMode }"
       @mousedown="onCanvasMouseDown"
       @contextmenu="onCanvasContextMenu"
       @wheel="panZoom.onWheel"
@@ -4020,6 +4536,87 @@ onMounted(() => {
               :fill="lineColorFor(e.from, e.to)"
               stroke="none"
             />
+          </g>
+          <!-- Relationship lines ("联系") — dashed curves between
+               arbitrary node pairs.  Rendered above the tree edges
+               but under the DOM nodes (the .zm-world layer comes
+               after this SVG).  The .zm-svg-layer is
+               pointer-events:none, so interactive children opt back
+               in via their own pointer-events CSS. -->
+          <g class="zm-relations">
+            <template v-for="g in relationGeoms" :key="g.rel.id">
+              <!-- Fat invisible hit path so the thin dashed line is
+                   easy to click. -->
+              <path
+                class="zm-relation-hit"
+                :d="g.d"
+                @click="(e) => onRelationClick(e, g.rel.id)"
+                @dblclick="(e) => { e.stopPropagation(); startRelationLabelEdit(g.rel.id) }"
+              />
+              <path
+                class="zm-relation-path"
+                :class="{ 'is-selected': selectedRelationId === g.rel.id }"
+                :d="g.d"
+              />
+              <!-- Arrowheads (default: one at the target end). -->
+              <path
+                v-if="g.arrowEnd"
+                class="zm-relation-arrow"
+                :class="{ 'is-selected': selectedRelationId === g.rel.id }"
+                :d="g.arrowEnd"
+              />
+              <path
+                v-if="g.arrowStart"
+                class="zm-relation-arrow"
+                :class="{ 'is-selected': selectedRelationId === g.rel.id }"
+                :d="g.arrowStart"
+              />
+              <text
+                v-if="g.rel.label && relationEditingId !== g.rel.id"
+                class="zm-relation-label"
+                :x="g.labelPos.x"
+                :y="g.labelPos.y - 6"
+                text-anchor="middle"
+                @click="(e) => onRelationClick(e, g.rel.id)"
+                @dblclick="(e) => { e.stopPropagation(); startRelationLabelEdit(g.rel.id) }"
+              >{{ g.rel.label }}</text>
+              <!-- Selection handles: 2 endpoint anchors (circles,
+                   drag along the node edge or drop onto another
+                   node to re-attach) + 2 bezier control points
+                   (squares, free drag). -->
+              <template v-if="selectedRelationId === g.rel.id && !props.previewMode">
+                <line
+                  class="zm-relation-guide"
+                  :x1="g.from.x" :y1="g.from.y" :x2="g.c1.x" :y2="g.c1.y"
+                />
+                <line
+                  class="zm-relation-guide"
+                  :x1="g.to.x" :y1="g.to.y" :x2="g.c2.x" :y2="g.c2.y"
+                />
+                <circle
+                  class="zm-relation-handle zm-relation-handle-endpoint"
+                  :cx="g.from.x" :cy="g.from.y" :r="6 / panZoom.scale.value"
+                  @pointerdown="(e) => onRelationHandlePointerDown(e, g.rel.id, 'from')"
+                />
+                <circle
+                  class="zm-relation-handle zm-relation-handle-endpoint"
+                  :cx="g.to.x" :cy="g.to.y" :r="6 / panZoom.scale.value"
+                  @pointerdown="(e) => onRelationHandlePointerDown(e, g.rel.id, 'to')"
+                />
+                <rect
+                  class="zm-relation-handle zm-relation-handle-ctrl"
+                  :x="g.c1.x - 5 / panZoom.scale.value" :y="g.c1.y - 5 / panZoom.scale.value"
+                  :width="10 / panZoom.scale.value" :height="10 / panZoom.scale.value"
+                  @pointerdown="(e) => onRelationHandlePointerDown(e, g.rel.id, 'c1')"
+                />
+                <rect
+                  class="zm-relation-handle zm-relation-handle-ctrl"
+                  :x="g.c2.x - 5 / panZoom.scale.value" :y="g.c2.y - 5 / panZoom.scale.value"
+                  :width="10 / panZoom.scale.value" :height="10 / panZoom.scale.value"
+                  @pointerdown="(e) => onRelationHandlePointerDown(e, g.rel.id, 'c2')"
+                />
+              </template>
+            </template>
           </g>
         </svg>
       </div>
@@ -4092,6 +4689,11 @@ onMounted(() => {
             'is-search-hit': isSearchHit(n.id),
             'is-search-current': isCurrentSearchHit(n.id),
             'is-search-dimmed': isSearchDimmed(n.id),
+            'is-relation-source': relationMode?.fromId === n.id,
+            'is-relation-target':
+              relationDrag !== null &&
+              (relationDrag.end === 'from' || relationDrag.end === 'to') &&
+              relationDrag.hoverNodeId === n.id,
           }"
           :style="{
             left: n.x + 'px',
@@ -4298,6 +4900,25 @@ onMounted(() => {
             <Icon name="x" :size="10" :stroke="2.2" />
           </button>
         </div>
+
+        <!-- Relationship-label inline editor — floats at the
+             curve midpoint (world coords, so it rides the pan/zoom
+             transform).  Enter / blur commits, Esc cancels. -->
+        <input
+          v-if="editingRelationGeom"
+          v-model="relationEditText"
+          class="zm-relation-label-input"
+          placeholder="联系"
+          :style="{
+            left: editingRelationGeom.labelPos.x + 'px',
+            top: editingRelationGeom.labelPos.y + 'px',
+          }"
+          @blur="commitRelationLabel"
+          @keydown.enter.prevent="commitRelationLabel"
+          @keydown.esc="relationEditingId = null"
+          @mousedown.stop
+          @click.stop
+        />
       </div>
 
       <!-- Floating tooltip for truncated node labels.  Renders
@@ -4342,6 +4963,7 @@ onMounted(() => {
         @clear-markers="menuClearMarkers"
         @add-tag="menuAddTag"
         @remove-tags="menuRemoveTags"
+        @add-relation="menuAddRelation"
         @close="closeContextMenu"
       />
 
@@ -4455,6 +5077,14 @@ onMounted(() => {
           @click="selectedId && doAddSibling(selectedId)"
         >
           <img :src="addNodeIcon" width="14" height="14" alt="添加同级" draggable="false" />
+        </button>
+        <button
+          class="zm-tb-btn"
+          :class="{ active: !!relationMode }"
+          title="联系（依次点选两个节点，Esc 取消）"
+          @click="onRelationToolbarClick"
+        >
+          <Icon name="relation" />
         </button>
         <span class="zm-tb-divider" />
         <button
@@ -5174,6 +5804,107 @@ overflow: hidden;
   background: #fee2e2;
   color: #b91c1c;
   border-color: #fca5a5;
+}
+
+/* ----------------------------------------------------------------
+ * Relationship lines ("联系") — dashed curves between arbitrary
+ * node pairs.  The .zm-svg-layer above is pointer-events:none, so
+ * the interactive pieces (hit path, label, handles) opt back in
+ * individually.  Handle radii are divided by the zoom scale in the
+ * template so they stay a constant screen size; `vector-effect:
+ * non-scaling-stroke` keeps their borders crisp at any zoom.
+ * ---------------------------------------------------------------- */
+.zm-relation-path {
+  fill: none;
+  stroke: #94a3b8;
+  stroke-width: 1.5;
+  stroke-dasharray: 6 4;
+  stroke-linecap: round;
+  pointer-events: none;
+}
+.zm-relation-path.is-selected {
+  stroke: #3b82f6;
+}
+/* Filled triangle at the line end(s); colour tracks the line. */
+.zm-relation-arrow {
+  fill: #94a3b8;
+  stroke: none;
+  pointer-events: none;
+}
+.zm-relation-arrow.is-selected {
+  fill: #3b82f6;
+}
+/* Invisible fat stroke that makes the thin line easy to click. */
+.zm-relation-hit {
+  fill: none;
+  stroke: transparent;
+  stroke-width: 14;
+  pointer-events: stroke;
+  cursor: pointer;
+}
+.zm-relation-label {
+  font-size: 12px;
+  fill: #64748b;
+  /* White halo keeps the label readable over tree edges. */
+  paint-order: stroke;
+  stroke: #ffffff;
+  stroke-width: 3px;
+  pointer-events: all;
+  cursor: pointer;
+  user-select: none;
+}
+.zm-relation-guide {
+  stroke: #3b82f6;
+  stroke-width: 1;
+  stroke-dasharray: 3 3;
+  pointer-events: none;
+  vector-effect: non-scaling-stroke;
+}
+.zm-relation-handle {
+  fill: #ffffff;
+  stroke: #3b82f6;
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+  pointer-events: all;
+  cursor: grab;
+}
+.zm-relation-handle:hover {
+  fill: #dbeafe;
+}
+.zm-relation-handle-ctrl {
+  stroke: #f59e0b;
+}
+.zm-relation-handle-ctrl:hover {
+  fill: #fef3c7;
+}
+/* Relation-creation mode: crosshair cursor + source-node ring. */
+.zm-canvas.is-relation-mode {
+  cursor: crosshair;
+}
+.zm-node.is-relation-source {
+  box-shadow: 0 0 0 2px #3b82f6, 0 0 0 5px rgba(59, 130, 246, 0.25);
+}
+/* Drop target highlight while dragging an endpoint handle over
+ * another node (re-attach). */
+.zm-node.is-relation-target {
+  box-shadow: 0 0 0 2px #22c55e, 0 0 0 5px rgba(34, 197, 94, 0.25);
+}
+/* Floating label editor — world coords inside .zm-world. */
+.zm-relation-label-input {
+  position: absolute;
+  transform: translate(-50%, -110%);
+  min-width: 72px;
+  padding: 2px 8px;
+  font-size: 12px;
+  line-height: 1.5;
+  border: 1px solid #3b82f6;
+  border-radius: 4px;
+  outline: none;
+  background: #ffffff;
+  color: #334155;
+  text-align: center;
+  box-shadow: 0 2px 8px rgba(15, 23, 42, 0.12);
+  z-index: 5;
 }
 
 /* Inline note editor removed in commit 0ec… — the note editor

@@ -61,6 +61,9 @@ const emit = defineEmits<{
   (e: 'addTag'): void
   /** Remove all tags from the node. */
   (e: 'removeTags'): void
+  /** Start a relationship line ("联系") from this node — the user
+   *  then clicks the target node to complete it. */
+  (e: 'addRelation'): void
   (e: 'close'): void
 }>()
 
@@ -77,7 +80,7 @@ const clamped = computed<ClampedPos>(() => {
     const menuWidth = 180
     // Count visible rows: 3 base (image/link/note), +1 each for
     // "remove" rows that follow an existing item, +1 for code,
-    // +1 for table.
+    // +1 for table, +2 for tags row + relation row.
     const rows =
       3 +
       (props.hasImage ? 1 : 0) +
@@ -86,7 +89,10 @@ const clamped = computed<ClampedPos>(() => {
       1 +
       (props.hasCode ? 1 : 0) +
       1 +
-      (props.hasTable ? 1 : 0)
+      (props.hasTable ? 1 : 0) +
+      1 +
+      (props.nodeTags.length > 0 ? 1 : 0) +
+      1
     const menuHeight = 4 + rows * 28
     if (left + menuWidth > rect.right) {
       left = Math.max(rect.left + 4, props.x - menuWidth - 2)
@@ -233,6 +239,15 @@ function run(handler: () => void) {
     <button v-if="hasTags" class="zm-node-menu-item" @click.stop="run(() => emit('removeTags'))">
       <Icon name="x" :size="13" />
       <span>移除标签</span>
+    </button>
+
+    <div class="zm-node-menu-divider" />
+
+    <!-- Relationship line ("联系") — enter creation mode with this
+         node as the first endpoint. -->
+    <button class="zm-node-menu-item" @click.stop="run(() => emit('addRelation'))">
+      <Icon name="relation" :size="13" />
+      <span>添加联系</span>
     </button>
   </div>
 </template>

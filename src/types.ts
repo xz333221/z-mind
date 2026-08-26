@@ -65,6 +65,54 @@ export interface MindMapNode {
    * pill color is derived from a hash of the label text.
    */
   tags?: string[]
+  /**
+   * XMind-style relationship lines ("联系") connecting arbitrary
+   * pairs of nodes.  Only meaningful on the ROOT node — the
+   * canvas reads/writes `root.relations`; entries reference
+   * other nodes by id.  Survives JSON export/import and
+   * undo/redo (plain JSON shape), but is NOT serialized to
+   * markdown (node ids are regenerated on markdown re-import,
+   * so the references would dangle).
+   */
+  relations?: MindMapRelation[]
+}
+
+/**
+ * A free-form connection between any two nodes (XMind "联系").
+ * Rendered as a dashed cubic-bezier curve with an optional text
+ * label at the midpoint.  When the line is selected the canvas
+ * shows four handles: two endpoint anchors (drag along the node
+ * edge, or drop onto another node to re-attach) and two bezier
+ * control points (free drag).
+ */
+export interface MindMapRelation {
+  id: string
+  fromId: string
+  toId: string
+  /**
+   * Endpoint anchor offset along the node edge, normalized to
+   * -1..1.  The anchor starts at the point where the centers'
+   * connecting line exits the node box; `fromT` / `toT` slide it
+   * along the edge perimeter.  Default 0 (no offset).
+   */
+  fromT?: number
+  toT?: number
+  /**
+   * Bezier control point overrides in world coordinates.  When
+   * absent, the canvas derives default control points (perpendicular
+   * to the endpoint tangent) so fresh relations get a pleasant
+   * automatic curve.  Written when the user drags a control handle.
+   */
+  c1?: { x: number; y: number }
+  c2?: { x: number; y: number }
+  /** Text shown at the curve midpoint.  Empty/undefined = no label. */
+  label?: string
+  /** Reserved for a future style panel — not yet consumed by the UI. */
+  color?: string
+  dash?: boolean
+  /** Arrowheads on the line.  Default 'end' (XMind 联系 style —
+   *  the arrow points at the second-picked node). */
+  arrow?: 'none' | 'end' | 'both'
 }
 
 /**
@@ -386,4 +434,16 @@ export interface MindMapExpose {
   /** The zero-based index of the currently focused search match,
    *  or -1 when no match is focused. */
   getSearchIndex: () => number
+  /** Create a relationship line ("联系") between two nodes.
+   *  Returns the new relation's id, or null when the pair is
+   *  invalid (same node, unknown id, or already connected in
+   *  the same direction). */
+  addRelation: (fromId: string, toId: string) => string | null
+  /** Remove a relationship line by id (no-op if absent). */
+  removeRelation: (relationId: string) => void
+  /** Patch a relationship line (label, anchors, control points).
+   *  No-op if the relation does not exist. */
+  updateRelation: (relationId: string, patch: Partial<Omit<MindMapRelation, 'id' | 'fromId' | 'toId'>>) => void
+  /** Read all relationship lines (empty array when none). */
+  getRelations: () => MindMapRelation[]
 }

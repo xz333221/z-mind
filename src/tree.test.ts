@@ -15,6 +15,12 @@ import {
   markdownToMindMap,
   mindMapToMarkdown,
   markdownToRichMindMap,
+  addRelation,
+  removeRelation,
+  findRelation,
+  updateRelation,
+  reattachRelation,
+  removeRelationsForNode,
   DEFAULT_NEW_NODE_TEXT,
 } from './tree'
 import type { MindMapNode } from './types'
@@ -586,5 +592,97 @@ describe('markdownToRichMindMap', () => {
     // Phase 2's children: table only (no body block follows).
     expect(phase2.children.length).toBe(1)
     expect(phase2.children[0].richContent?.kind).toBe('table')
+  })
+})
+
+describe('relations (联系)', () => {
+  it('addRelation creates a relation on the root', () => {
+    const rel = addRelation(sample, 'a', 'b')
+    expect(rel).not.toBeNull()
+    expect(rel!.fromId).toBe('a')
+    expect(rel!.toId).toBe('b')
+    expect(sample.relations).toHaveLength(1)
+    expect(findRelation(sample, rel!.id)).toBe(rel)
+  })
+
+  it('rejects self-connections', () => {
+    expect(addRelation(sample, 'a', 'a')).toBeNull()
+    expect(sample.relations ?? []).toHaveLength(0)
+  })
+
+  it('rejects unknown node ids', () => {
+    expect(addRelation(sample, 'a', 'zzz')).toBeNull()
+    expect(addRelation(sample, 'zzz', 'a')).toBeNull()
+  })
+
+  it('rejects duplicate (fromId, toId) pairs but allows the reverse', () => {
+    expect(addRelation(sample, 'a', 'b')).not.toBeNull()
+    expect(addRelation(sample, 'a', 'b')).toBeNull()
+    expect(addRelation(sample, 'b', 'a')).not.toBeNull()
+    expect(sample.relations).toHaveLength(2)
+  })
+
+  it('removeRelation deletes by id', () => {
+    const rel = addRelation(sample, 'a', 'b')!
+    expect(removeRelation(sample, rel.id)).toBe(true)
+    expect(removeRelation(sample, rel.id)).toBe(false)
+    expect(sample.relations).toHaveLength(0)
+  })
+
+  it('updateRelation patches label / anchors / control points', () => {
+    const rel = addRelation(sample, 'a', 'b')!
+    expect(
+      updateRelation(sample, rel.id, {
+        label: '依赖',
+        fromT: 1.5,
+        c1: { x: 10, y: 20 },
+      })
+    ).toBe(true)
+    const r = findRelation(sample, rel.id)!
+    expect(r.label).toBe('依赖')
+    expect(r.fromT).toBe(1.5)
+    expect(r.c1).toEqual({ x: 10, y: 20 })
+    expect(updateRelation(sample, 'nope', { label: 'x' })).toBe(false)
+  })
+
+  it('reattachRelation moves an end to another node and clears its anchor', () => {
+    const rel = addRelation(sample, 'a', 'b')!
+    updateRelation(sample, rel.id, { fromT: 2, c1: { x: 1, y: 1 }, c2: { x: 2, y: 2 } })
+    expect(reattachRelation(sample, rel.id, 'from', 'a1')).toBe(true)
+    const r = findRelation(sample, rel.id)!
+    expect(r.fromId).toBe('a1')
+    expect(r.fromT).toBeUndefined()
+    expect(r.c1).toBeUndefined()
+    expect(r.c2).toBeUndefined()
+  })
+
+  it('reattachRelation refuses to connect a node to itself or duplicate a pair', () => {
+    const rel = addRelation(sample, 'a', 'b')!
+    // Moving 'from' onto the current 'to' would create a self-loop.
+    expect(reattachRelation(sample, rel.id, 'from', 'b')).toBe(false)
+    // Unknown node.
+    expect(reattachRelation(sample, rel.id, 'from', 'zzz')).toBe(false)
+    // Duplicate pair: a1→b already exists.
+    addRelation(sample, 'a1', 'b')
+    expect(reattachRelation(sample, rel.id, 'from', 'a1')).toBe(false)
+  })
+
+  it('removeRelationsForNode drops only relations touching that node', () => {
+    addRelation(sample, 'a', 'b')
+    addRelation(sample, 'a1', 'b1')
+    addRelation(sample, 'a1', 'a2')
+    expect(removeRelationsForNode(sample, 'a')).toBe(1)
+    expect(sample.relations).toHaveLength(2)
+    expect(removeRelationsForNode(sample, 'zzz')).toBe(0)
+    expect(removeRelationsForNode(sample, 'b1')).toBe(1)
+    expect(sample.relations).toHaveLength(1)
+  })
+
+  it('relations survive clone() (JSON round-trip)', () => {
+    addRelation(sample, 'a', 'b')
+    updateRelation(sample, sample.relations![0].id, { label: 'L', c1: { x: 1, y: 2 } })
+    const c = clone(sample)
+    expect(c.relations).toEqual(sample.relations)
+    expect(c.relations).not.toBe(sample.relations)
   })
 })

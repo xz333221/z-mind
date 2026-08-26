@@ -423,3 +423,158 @@ describe('clipboard (Ctrl+C / Ctrl+X / Ctrl+V)', () => {
     expect(JSON.stringify(exposed.getData())).toBe(after1)
   })
 })
+describe('relations (联系)', () => {
+  interface RelExpose {
+    addRelation: (fromId: string, toId: string) => string | null
+    removeRelation: (id: string) => void
+    updateRelation: (id: string, patch: Record<string, unknown>) => void
+    getRelations: () => { id: string; fromId: string; toId: string; label?: string }[]
+    removeNode: (id: string) => void
+    undo: () => void
+    redo: () => void
+    exportData: () => string
+    importData: (json: string) => boolean
+    getData: () => MindMapNode
+  }
+  const exposeOf = (wrapper: ReturnType<typeof mount>) =>
+    wrapper.vm as unknown as RelExpose
+
+  it('addRelation renders a dashed path between the two nodes', async () => {
+    const wrapper = mount(MindMap, { props: { data: sampleData() } })
+    await flushPromises()
+    const exposed = exposeOf(wrapper)
+
+    expect(wrapper.find('.zm-relation-path').exists()).toBe(false)
+    const id = exposed.addRelation('a', 'b')
+    expect(id).toBeTruthy()
+    await flushPromises()
+
+    const path = wrapper.find('.zm-relation-path')
+    expect(path.exists()).toBe(true)
+    expect(path.attributes('d')).toMatch(/^M /)
+    // Default arrow: one triangle at the target ('to') end.
+    expect(wrapper.findAll('.zm-relation-arrow')).toHaveLength(1)
+    // A freshly-created relation is auto-selected → its four
+    // handles render (2 endpoint circles + 2 control rects).
+    expect(wrapper.findAll('.zm-relation-handle-endpoint')).toHaveLength(2)
+    expect(wrapper.findAll('.zm-relation-handle-ctrl')).toHaveLength(2)
+  })
+
+  it('relation arrow honours arrow: none / end / both', async () => {
+    const wrapper = mount(MindMap, { props: { data: sampleData() } })
+    await flushPromises()
+    const exposed = exposeOf(wrapper)
+    const id = exposed.addRelation('a', 'b')!
+    await flushPromises()
+    expect(wrapper.findAll('.zm-relation-arrow')).toHaveLength(1)
+
+    exposed.updateRelation(id, { arrow: 'none' })
+    await flushPromises()
+    expect(wrapper.findAll('.zm-relation-arrow')).toHaveLength(0)
+
+    exposed.updateRelation(id, { arrow: 'both' })
+    await flushPromises()
+    expect(wrapper.findAll('.zm-relation-arrow')).toHaveLength(2)
+  })
+
+  it('addRelation rejects self / duplicate / unknown pairs', async () => {
+    const wrapper = mount(MindMap, { props: { data: sampleData() } })
+    await flushPromises()
+    const exposed = exposeOf(wrapper)
+
+    expect(exposed.addRelation('a', 'a')).toBeNull()
+    expect(exposed.addRelation('a', 'zzz')).toBeNull()
+    expect(exposed.addRelation('a', 'b')).toBeTruthy()
+    expect(exposed.addRelation('a', 'b')).toBeNull()
+    expect(exposed.getRelations()).toHaveLength(1)
+  })
+
+  it('updateRelation sets the label, rendered as SVG text', async () => {
+    const wrapper = mount(MindMap, { props: { data: sampleData() } })
+    await flushPromises()
+    const exposed = exposeOf(wrapper)
+
+    const id = exposed.addRelation('a', 'b')!
+    await flushPromises()
+    expect(wrapper.find('.zm-relation-label').exists()).toBe(false)
+
+    exposed.updateRelation(id, { label: '依赖' })
+    await flushPromises()
+    const label = wrapper.find('.zm-relation-label')
+    expect(label.exists()).toBe(true)
+    expect(label.text()).toBe('依赖')
+  })
+
+  it('removing an endpoint node drops the relation', async () => {
+    const wrapper = mount(MindMap, { props: { data: sampleData() } })
+    await flushPromises()
+    const exposed = exposeOf(wrapper)
+
+    exposed.addRelation('a1', 'b')
+    exposed.addRelation('a', 'b')
+    expect(exposed.getRelations()).toHaveLength(2)
+
+    // Removing 'a' also removes its descendant 'a1' — both
+    // relations must go.
+    exposed.removeNode('a')
+    await flushPromises()
+    expect(exposed.getRelations()).toHaveLength(0)
+    await flushPromises()
+    expect(wrapper.find('.zm-relation-path').exists()).toBe(false)
+  })
+
+  it('undo/redo restores and re-removes the relation', async () => {
+    const wrapper = mount(MindMap, { props: { data: sampleData() } })
+    await flushPromises()
+    const exposed = exposeOf(wrapper)
+
+    exposed.addRelation('a', 'b')
+    expect(exposed.getRelations()).toHaveLength(1)
+
+    exposed.undo()
+    await flushPromises()
+    expect(exposed.getRelations()).toHaveLength(0)
+    expect(wrapper.find('.zm-relation-path').exists()).toBe(false)
+
+    exposed.redo()
+    await flushPromises()
+    expect(exposed.getRelations()).toHaveLength(1)
+    expect(wrapper.find('.zm-relation-path').exists()).toBe(true)
+  })
+
+  it('removeRelation deletes the line (and its handles)', async () => {
+    const wrapper = mount(MindMap, { props: { data: sampleData() } })
+    await flushPromises()
+    const exposed = exposeOf(wrapper)
+
+    const id = exposed.addRelation('a', 'b')!
+    await flushPromises()
+    exposed.removeRelation(id)
+    await flushPromises()
+    expect(exposed.getRelations()).toHaveLength(0)
+    expect(wrapper.find('.zm-relation-path').exists()).toBe(false)
+    expect(wrapper.find('.zm-relation-handle').exists()).toBe(false)
+  })
+
+  it('export/import JSON round-trips relations', async () => {
+    const wrapper = mount(MindMap, { props: { data: sampleData() } })
+    await flushPromises()
+    const exposed = exposeOf(wrapper)
+
+    const id = exposed.addRelation('a', 'b')!
+    exposed.updateRelation(id, { label: 'L' })
+    const json = exposed.exportData()
+
+    const wrapper2 = mount(MindMap, { props: { data: sampleData() } })
+    await flushPromises()
+    const exposed2 = exposeOf(wrapper2)
+    expect(exposed2.importData(json)).toBe(true)
+    await flushPromises()
+    const rels = exposed2.getRelations()
+    expect(rels).toHaveLength(1)
+    expect(rels[0].fromId).toBe('a')
+    expect(rels[0].toId).toBe('b')
+    expect(rels[0].label).toBe('L')
+    expect(wrapper2.find('.zm-relation-path').exists()).toBe(true)
+  })
+})

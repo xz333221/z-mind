@@ -1,4 +1,4 @@
-import type { MindMapNode, MindMapImage } from './types'
+import type { MindMapNode, MindMapImage, MindMapRelation } from './types'
 
 export function uid(): string {
   return 'n_' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4)
@@ -239,6 +239,110 @@ export function countDescendants(n: MindMapNode): number {
 }
 
 export const DEFAULT_NEW_NODE_TEXT = '新节点'
+
+// ---------------------------------------------------------------------------
+// Relationship lines ("联系") — free-form connections between any two
+// nodes, stored on the ROOT node as `root.relations`.  These are plain
+// JSON shapes so they ride along with clone()/export/undo for free.
+// ---------------------------------------------------------------------------
+
+/** Read the relations array, lazily initialized.  Internal helper —
+ *  exported callers use the CRUD functions below. */
+function relationsOf(root: MindMapNode): MindMapRelation[] {
+  if (!root.relations) root.relations = []
+  return root.relations
+}
+
+export function findRelation(root: MindMapNode, id: string): MindMapRelation | null {
+  return root.relations?.find((r) => r.id === id) ?? null
+}
+
+/** Create a relationship between two nodes.  Returns the new
+ *  relation, or null when the pair is invalid: same node on both
+ *  ends, an unknown node id, or an identical (fromId, toId)
+ *  connection already exists. */
+export function addRelation(
+  root: MindMapNode,
+  fromId: string,
+  toId: string
+): MindMapRelation | null {
+  if (fromId === toId) return null
+  if (!findNode(root, fromId) || !findNode(root, toId)) return null
+  const list = relationsOf(root)
+  if (list.some((r) => r.fromId === fromId && r.toId === toId)) return null
+  const rel: MindMapRelation = { id: uid(), fromId, toId }
+  list.push(rel)
+  return rel
+}
+
+export function removeRelation(root: MindMapNode, id: string): boolean {
+  const list = root.relations
+  if (!list) return false
+  const idx = list.findIndex((r) => r.id === id)
+  if (idx < 0) return false
+  list.splice(idx, 1)
+  return true
+}
+
+/** Patch a relation in place (label / anchors / control points).
+ *  `fromId` / `toId` / `id` are ignored — re-attach goes through
+ *  `reattachRelation`.  Returns true on success. */
+export function updateRelation(
+  root: MindMapNode,
+  id: string,
+  patch: Partial<Omit<MindMapRelation, 'id' | 'fromId' | 'toId'>>
+): boolean {
+  const rel = findRelation(root, id)
+  if (!rel) return false
+  Object.assign(rel, patch)
+  return true
+}
+
+/** Move one end of a relation to a different node.  `end` selects
+ *  which side ('from' | 'to').  No-op (returns false) when the new
+ *  node is unknown, equals the other endpoint, or the resulting
+ *  (fromId, toId) pair already exists.  Clears the moved end's
+ *  anchor offset so the line re-anchors at the new node's edge. */
+export function reattachRelation(
+  root: MindMapNode,
+  id: string,
+  end: 'from' | 'to',
+  newNodeId: string
+): boolean {
+  const rel = findRelation(root, id)
+  if (!rel) return false
+  if (!findNode(root, newNodeId)) return false
+  const other = end === 'from' ? rel.toId : rel.fromId
+  if (newNodeId === other) return false
+  const fromId = end === 'from' ? newNodeId : rel.fromId
+  const toId = end === 'to' ? newNodeId : rel.toId
+  if (root.relations?.some((r) => r.id !== id && r.fromId === fromId && r.toId === toId)) {
+    return false
+  }
+  if (end === 'from') {
+    rel.fromId = newNodeId
+    delete rel.fromT
+  } else {
+    rel.toId = newNodeId
+    delete rel.toT
+  }
+  // The old control points were tuned for the previous geometry —
+  // drop them so the re-attached line gets a fresh auto curve.
+  delete rel.c1
+  delete rel.c2
+  return true
+}
+
+/** Drop every relation that references `nodeId` on either end.
+ *  Called by the canvas when a node (or its subtree) is removed.
+ *  Returns the number of relations removed. */
+export function removeRelationsForNode(root: MindMapNode, nodeId: string): number {
+  const list = root.relations
+  if (!list || list.length === 0) return 0
+  const before = list.length
+  root.relations = list.filter((r) => r.fromId !== nodeId && r.toId !== nodeId)
+  return before - root.relations.length
+}
 
 /**
  * Parse a Markdown string into a MindMapNode tree.  Each heading
