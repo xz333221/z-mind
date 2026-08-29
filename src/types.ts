@@ -174,13 +174,17 @@ export interface MindMapTheme {
 export type LineStyle = 'curve' | 'straight' | 'arc' | 'elbow' | 'rounded-elbow'
 export type LayoutMode = 'mindmap' | 'tree' | 'org'
 /** Where root-originated edges start on the root node.
- *  'edge' = left/right mid-edge (default, XMind classic),
+ *  'edge' = left/right mid-edge (legacy side-anchor mode),
  *  'center' = root node center — the line emerges from underneath
  *  the root box, covered by it.
- *  'proportional' = the exit point on the root edge is projected
- *  from the child's position (ray-cast), so children above the
- *  center exit from the upper part of the edge and vice versa. */
-export type LineOrigin = 'edge' | 'center' | 'proportional'
+ *  'proportional' = the exit point on the root border is the
+ *  ray-cast from the root center toward the child, so children
+ *  above exit through the top edge, children below through the
+ *  bottom edge.
+ *  'xmind' = distributed hidden start slots on the root's
+ *  horizontal center line.  Slots follow branch order on each side
+ *  and are not a linear mapping of y-distance along one edge. */
+export type LineOrigin = 'edge' | 'center' | 'proportional' | 'xmind'
 
 /** Identifier for a branch palette — the id of a built-in (e.g.
  *  'default', 'classic', 'vivid', 'dev', 'mint') or a user-defined
@@ -239,9 +243,10 @@ export interface MindMapSettings {
    *  left/right mid-edge of the root node; 'center' = the root
    *  node's geometric center — the line is drawn from the center
    *  but visually covered by the root box, so it appears to emerge
-   *  from underneath the root; 'proportional' = the exit point is
-   *  projected from the child's position so each child exits the
-   *  root at the closest edge point (fan / ray-cast). */
+   *  from underneath the root; 'proportional' = ray-cast from the
+   *  root center toward the child, intersected with the border;
+   *  'xmind' = distributed hidden start slots on the root's
+   *  horizontal center line, matching XMind's fan geometry. */
   lineOrigin: LineOrigin
   /** Layout mode (1.html parity).  'mindmap' = center + left/right
    *  fans; 'tree' = single column expanding to the right; 'org' =

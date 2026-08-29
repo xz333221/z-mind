@@ -3350,6 +3350,14 @@ function siblingIndexOf(id: string): number {
 // with the root's border.  Children above the center exit from the
 // upper part of the edge; children below exit from the lower part,
 // creating a natural fan/radiation effect.
+//
+// When `settings.lineOrigin === 'xmind'`, root edges start from
+// distributed slots on the root's horizontal centre line (hidden
+// under the root box).  Slots are assigned from the branch order on
+// each side; the curve then determines where it visibly leaves the
+// root border.  This is why XMind does not make every branch appear
+// to originate at the exact centre, nor does it use a y-distance
+// ratio.
 // =====================================================================
 function lineAnchor(
   n: LayoutNode,
@@ -3363,33 +3371,64 @@ function lineAnchor(
   if (side === 'out' && n.isRoot && settings.lineOrigin === 'center') {
     return { x: n.x, y: n.y }
   }
-  // Root-originated edges with proportional start point.  The Y
-  // is always pinned to the root's horizontal center axis (root.y),
-  // and the X interpolates from the edge toward the center based on
-  // how far the child is from that axis.  The reference distance is
-  // the *maximum* vertical offset among all root children, so the
-  // furthest child gets ratio = 1 (starts at center, like 'center'
-  // mode) while a child at the same height gets ratio = 0 (starts
-  // at the edge, like 'edge' mode).
-  if (side === 'out' && n.isRoot && settings.lineOrigin === 'proportional' && child) {
-    const rootChildren = layoutResult.value.root.children
+  // XMind's root fan distributes its hidden start points along the
+  // horizontal centre line.  The outer (top/bottom) branches on a
+  // busy side stay close to the centre, while inner side branches
+  // are pulled farther toward that side.  With only two branches
+  // (the common right-side case) both occupy the wider slot.  This
+  // ordinal rule is intentionally independent of the children's
+  // pixel y-distance, so dragging or resizing a branch does not
+  // make the root anchors jump around.
+  if (side === 'out' && n.isRoot && settings.lineOrigin === 'xmind' && child) {
     if (childDir === 'down') {
-      // Vertical layout: X pinned to root center, Y interpolates
-      // from bottom edge toward center.
-      const maxDx = rootChildren.reduce((m, c) => Math.max(m, Math.abs(c.x - n.x)), 1)
-      const ratio = Math.min(1, Math.abs(child.x - n.x) / maxDx)
-      const edgeY = n.y + n.height / 2
-      const centerY = n.y
-      return { x: n.x, y: edgeY + (centerY - edgeY) * ratio }
+      // In org mode the fan is vertical; keep the root source on
+      // its centre line so the normal vertical curve handles the
+      // visible bottom-edge exit.
+      return { x: n.x, y: n.y }
     }
-    // Horizontal layout: Y pinned to root center, X interpolates
-    // from left/right edge toward center.
-    const maxDy = rootChildren.reduce((m, c) => Math.max(m, Math.abs(c.y - n.y)), 1)
-    const ratio = Math.min(1, Math.abs(child.y - n.y) / maxDy)
     const d = dir !== undefined ? dir : n.side
-    const edgeX = n.x + d * (n.width / 2)
-    const centerX = n.x
-    return { x: edgeX + (centerX - edgeX) * ratio, y: n.y }
+    const siblings = n.children
+      .filter((c) => c.side === d)
+      .sort((a, b) => a.y - b.y)
+    const count = siblings.length
+    const rank = Math.max(0, siblings.findIndex((c) => c.id === child.id))
+    let fraction = 0
+    if (count === 2) {
+      // Two branches form the top/bottom pair and sit toward the
+      // outside of the root, as in XMind's right-side fan.
+      fraction = 0.70
+    } else if (count >= 3) {
+      const outer = rank === 0 || rank === count - 1
+      fraction = outer ? 0.17 : 0.45
+    }
+    return { x: n.x + d * (n.width / 2) * fraction, y: n.y }
+  }
+  // Root-originated edges with ray-cast start points ('proportional'
+  // — shoot a ray from the root's center toward the child
+  // and return its intersection with the root's border.  Children
+  // above the center exit through the TOP edge, children to the
+  // side through the LEFT/RIGHT edge, children below through the
+  // BOTTOM edge — the XMind fan.  This adapts to the root box's
+  // aspect ratio for free: wide roots mostly exit sideways, tall
+  // roots mostly exit through top/bottom.  Works for every layout
+  // direction (left/right/down) without special-casing.
+  if (
+    side === 'out' &&
+    n.isRoot &&
+    settings.lineOrigin === 'proportional' &&
+    child
+  ) {
+    const dx = child.x - n.x
+    const dy = child.y - n.y
+    const hw = n.width / 2
+    const hh = n.height / 2
+    // Parametric t where the ray crosses the rect border: the
+    // smaller of the x-axis and y-axis crossing distances.
+    const tx = dx !== 0 ? hw / Math.abs(dx) : Infinity
+    const ty = dy !== 0 ? hh / Math.abs(dy) : Infinity
+    const t = Math.min(tx, ty)
+    if (!Number.isFinite(t)) return { x: n.x, y: n.y }
+    return { x: n.x + dx * t, y: n.y + dy * t }
   }
   if (childDir === 'down') {
     // Vertical layout (org mode): line lands on top/bottom mid-edge
