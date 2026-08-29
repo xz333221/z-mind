@@ -78,7 +78,7 @@ const settings = reactive<MindMapSettings>({
   customPalettes: [],
   lineStyle: 'rounded-elbow',
   rootLineStyle: 'arc',
-  lineOrigin: 'proportional',
+  lineOrigin: 'xmind',
   layoutMode: 'mindmap',
   taperedEdge: true,
   lineWidthTaper: 0.1,

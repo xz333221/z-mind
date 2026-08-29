@@ -680,7 +680,7 @@ function _resetSettings() {
   customPalettes: [],
   lineStyle: 'rounded-elbow',
   rootLineStyle: 'arc',
-  lineOrigin: 'proportional',
+  lineOrigin: 'xmind',
   layoutMode: 'mindmap',
   taperedEdge: true,
   lineWidthTaper: 0.3,
@@ -1127,6 +1127,7 @@ const hoveredId = ref<string | null>(null)
 // the node), and the canvas's click handler would otherwise clear
 // the selection we just re-set.  Flag is checked once and cleared.
 let suppressNextCanvasClick = false
+let suppressNextNodeClick = false
 function onNodeMouseEnter(id: string) {
   hoveredId.value = id
 }
@@ -1322,7 +1323,7 @@ const settings = reactive<MindMapSettings>({
   customPalettes: [],
 lineStyle: 'rounded-elbow',
 rootLineStyle: 'arc',
-lineOrigin: 'proportional',
+lineOrigin: 'xmind',
   layoutMode: 'mindmap',
   taperedEdge: true,
   lineWidthTaper: 0.3,
@@ -2212,7 +2213,33 @@ function writeSystemClipboard(text: string) {
   }
 }
 
+/** Match the Outline drawer's "复制大纲" representation: the root
+ *  is unbulleted and every descendant is represented by two spaces
+ *  per level plus a `- ` marker. */
+function outlineClipboardText(root: MindMapNode): string {
+  const lines: string[] = []
+  const walk = (n: MindMapNode, depth: number) => {
+    const indent = '  '.repeat(depth)
+    const bullet = depth === 0 ? '' : '- '
+    lines.push(indent + bullet + (n.text || ''))
+    for (const child of n.children) walk(child, depth + 1)
+  }
+  walk(root, 0)
+  return lines.join('\n')
+}
+
 function doCopy(ids: string[]) {
+  // Copying the root is intentionally the same operation as the
+  // Outline drawer's "复制大纲": put the complete indented outline
+  // on the system clipboard.  The root is not a pasteable subtree,
+  // so clear any previous internal node clipboard to avoid a stale
+  // Ctrl+V unexpectedly pasting older content.
+  if (ids.includes(dataRef.value.id)) {
+    clipboard.value = null
+    writeSystemClipboard(outlineClipboardText(dataRef.value))
+    triggerRef()
+    return
+  }
   const clean = preorderIds(clipboardableIds(ids))
   if (clean.length === 0) return
   const subs: MindMapNode[] = []
@@ -2536,6 +2563,14 @@ function doMoveSibling(dy: number) {
 }
 
 function onNodeClick(e: MouseEvent, n: LayoutNode) {
+  // A pointerdown near a selected relation endpoint can be delivered
+  // by the node DOM box (it sits above SVG). That gesture belongs to
+  // the relation handle, not the node; consume its trailing click so
+  // the relation stays selected after a drag or a simple re-grab.
+  if (suppressNextNodeClick) {
+    suppressNextNodeClick = false
+    return
+  }
   e.stopPropagation()
   // Relation-creation mode: clicks pick endpoints instead of
   // changing the selection.  First click fills `fromId` (when the
@@ -2621,12 +2656,42 @@ const DRAG_THRESHOLD = 4 // px of movement before a drag becomes "active"
 
 function onNodePointerDown(e: PointerEvent, n: LayoutNode) {
   if (props.previewMode) return
-  if (n.isRoot) return
   if (e.button !== 0) return
+  // A new node gesture supersedes any pending relation-click guard.
+  suppressNextNodeClick = false
   // The resize handle is a child of .zm-node; bail so the user
   // can drag the corner handle without reparenting.
   const target = e.target as HTMLElement | null
   if (target?.closest('.zm-img-resize-handle')) return
+
+  // Node DOM boxes are painted above the SVG relation layer, so a
+  // relation endpoint that sits on a node edge would otherwise be
+  // claimed by the node. Give the selected relation's endpoint a
+  // priority hit zone (screen-space, independent of zoom) and route
+  // the gesture directly to the relation drag handler.
+  if (selectedRelationId.value) {
+    const geom = relationGeoms.value.find((g) => g.rel.id === selectedRelationId.value)
+    if (geom) {
+      const wrapperRect = wrapperRef.value!.getBoundingClientRect()
+      const scale = panZoom.scale.value
+      const sx = (p: { x: number; y: number }) =>
+        wrapperRect.left + p.x * scale + panZoom.offsetX.value
+      const sy = (p: { x: number; y: number }) =>
+        wrapperRect.top + p.y * scale + panZoom.offsetY.value
+      const hitRadius = 20
+      const fromDist = Math.hypot(e.clientX - sx(geom.from), e.clientY - sy(geom.from))
+      const toDist = Math.hypot(e.clientX - sx(geom.to), e.clientY - sy(geom.to))
+      if (Math.min(fromDist, toDist) <= hitRadius) {
+        e.stopPropagation()
+        e.preventDefault()
+        suppressNextNodeClick = true
+        onRelationHandlePointerDown(e, geom.rel.id, fromDist <= toDist ? 'from' : 'to')
+        return
+      }
+    }
+  }
+
+  if (n.isRoot) return
   e.stopPropagation()
 
   // DO NOT touch the selection set here.  Drag-pickup is an
@@ -3135,6 +3200,10 @@ function onRelationHandleUp() {
   record()
   triggerRef()
   emit('change', dataRef.value)
+  // Releasing a relation handle on empty canvas produces a trailing
+  // canvas click. Keep the relation selected through that synthetic
+  // click; a later, intentional click on empty canvas will clear it.
+  suppressNextCanvasClick = true
 }
 
 // --- label editing ---------------------------------------------------------
@@ -3224,6 +3293,12 @@ function onCanvasClick(e: MouseEvent) {
   if (!target) return
   // Ignore clicks that land on a node or its control buttons.
   if (target.closest('.zm-node')) return
+  // Relation paths and handles own their pointer/click interactions.
+  // In particular, a handle drag emits a trailing click on pointerup;
+  // let that interaction finish without clearing the selected line.
+  // A subsequent click on genuinely empty canvas still reaches the
+  // deselection logic below.
+  if (target.closest('.zm-relations')) return
   // Ignore clicks that originate from the floating toolbar — it
   // sits inside .zm-canvas, so button clicks bubble here.  For
   // immediate-action buttons (zoom, add node…) the trailing
@@ -4633,6 +4708,28 @@ onMounted(() => {
                   :x1="g.to.x" :y1="g.to.y" :x2="g.c2.x" :y2="g.c2.y"
                 />
                 <circle
+                  class="zm-relation-handle-hit"
+                  :cx="g.from.x" :cy="g.from.y" :r="14 / panZoom.scale.value"
+                  @pointerdown="(e) => onRelationHandlePointerDown(e, g.rel.id, 'from')"
+                />
+                <circle
+                  class="zm-relation-handle-hit"
+                  :cx="g.to.x" :cy="g.to.y" :r="14 / panZoom.scale.value"
+                  @pointerdown="(e) => onRelationHandlePointerDown(e, g.rel.id, 'to')"
+                />
+                <rect
+                  class="zm-relation-handle-hit"
+                  :x="g.c1.x - 12 / panZoom.scale.value" :y="g.c1.y - 12 / panZoom.scale.value"
+                  :width="24 / panZoom.scale.value" :height="24 / panZoom.scale.value"
+                  @pointerdown="(e) => onRelationHandlePointerDown(e, g.rel.id, 'c1')"
+                />
+                <rect
+                  class="zm-relation-handle-hit"
+                  :x="g.c2.x - 12 / panZoom.scale.value" :y="g.c2.y - 12 / panZoom.scale.value"
+                  :width="24 / panZoom.scale.value" :height="24 / panZoom.scale.value"
+                  @pointerdown="(e) => onRelationHandlePointerDown(e, g.rel.id, 'c2')"
+                />
+                <circle
                   class="zm-relation-handle zm-relation-handle-endpoint"
                   :cx="g.from.x" :cy="g.from.y" :r="6 / panZoom.scale.value"
                   @pointerdown="(e) => onRelationHandlePointerDown(e, g.rel.id, 'from')"
@@ -5877,7 +5974,7 @@ overflow: hidden;
 .zm-relation-hit {
   fill: none;
   stroke: transparent;
-  stroke-width: 14;
+  stroke-width: 20;
   pointer-events: stroke;
   cursor: pointer;
 }
@@ -5904,6 +6001,12 @@ overflow: hidden;
   stroke: #3b82f6;
   stroke-width: 1.5;
   vector-effect: non-scaling-stroke;
+  pointer-events: all;
+  cursor: grab;
+}
+.zm-relation-handle-hit {
+  fill: transparent;
+  stroke: transparent;
   pointer-events: all;
   cursor: grab;
 }
